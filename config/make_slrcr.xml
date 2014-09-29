@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <experiment id="1">
+    <zos>
+      /Volumes/wddrive/cmip5/sea_level_above_geoid/rcp8.5/zos_Omon_CanESM2_rcp85_r1i1p1_200601-210012.nc
+    </zos>
+    <ph>
+      /Volumes/wddrive/cmip5/ph/ph_Omon_CanESM2_rcp85_r1i1p1_200601-210012.nc
+    </ph>
+  </experiment>
+  <experiment id="2">
+    <zos>
+      /Volumes/wddrive/cmip5/sea_level_above_geoid/rcp8.5/truc.nc
+    </zos>
+    <ph>
+      /Volumes/wddrive/cmip5/ph/machin.nc
+    </ph>
+  </experiment>
+</config>

@@ -1,0 +1,144 @@
+#!/bin/bash
+
+## \author Bruno Combal
+## \date March 2013
+
+# note: we don't want to use weighted averages, so averaging is done in a unique pass
+# if we average subgroups of files, we must count averaged files and be sure that
+# they have the same grid, and no-data values are at the same place.
+
+function mktmpdir(){
+    tmpRoot=$HOME/Documents/tmp
+    tmpDir=${tmpRoot}/${0##*/}_${RANDOM}_${RANDOM}
+    while [ -d ${tmpDir} ]
+    do
+	tmpDir=${tmpRoot}/${0##*/}_${RANDOM}_${RANDOM}
+    done
+    mkdir -p ${tmpDir}
+    echo ${tmpDir}
+}
+
+function yyyymmToCounter(){
+    yyyy=${1:0:4}
+    mm=${1:4:2}
+    echo "(${yyyy}-2000)*12+${mm}-1" | bc
+}
+
+function counterToyyyymm(){
+    counter=$1
+    yyyy=$( echo "${counter}/12" | bc)
+    mm=$( echo "${counter}-${yyyy}*12+1" | bc)
+    if [[ ${mm} -lt 10 ]]; then
+	echo $((yyyy+2000))0${mm}
+    else
+	echo $((yyyy+2000))${mm}
+    fi
+}
+
+## ensure we are running on uv-cdat
+source /usr/local/uvcdat/1.2.0/bin/setup_cdat.sh
+
+## compute ensemble mean and spread for TOS
+rcp='rcp8.5'
+variable='tos'
+timeStepType='Omon'
+TFStart="200601"
+TFEnd="205012"
+
+binDir=/home/bruno/Documents/dev/codes/bin
+inDir=/data/cmip5/rcp/${rcp}/${variable}
+outDir=/data/cmip5/rcp/${rcp}/${variable}_ensemble
+mkdir -p ${outDir}
+tmpDir=$(mktmpdir)
+
+# we want only dates before 2050=TFEnd: discard files with dates starting after 2050
+# in addition, the second date must be -ge to TFStart
+datesCouples=($(ls ${inDir}/*.nc | sed 's/tos.*rcp85_//' | sed 's/.*_//' | sed 's/\.nc//' | sed 's/-/ /'  | sort | uniq | awk '{if ($1 < '${TFEnd}' && $2 >='${TFStart}') printf "%d-%d\n",$1,$2}' | sort | uniq))
+
+# now trimm them: remove any date before or after the needed time frame, move result to temporary directory
+for ii in ${datesCouples[@]}
+do
+    dateStart=${ii%-*}
+    dateEnd=${ii#*-}
+    fileList=($(find ${inDir} -name '*'${ii}'.nc' -type f ! -size 0 -printf '%f\n' ))
+    for ifile in ${fileList[@]}
+    do
+	echo -n ">> $ifile"
+	timeFrame=$(echo ${ifile} | sed 's/.*_r\([0-9]\{1,2\}\)i\([0-9]\{1,2\}\)p\([0-9]\{1,2\}\)_//' | sed 's/\.nc$//' )
+	ftfStart=${timeFrame%-*}
+	ftfEnd=${timeFrame#*-}
+	if [[ $ftfStart -ge $TFStart && $ftfEnd -le $TFEnd ]]; then
+	    echo $ftfStart $ftfEnd ": XXX"
+	    cp ${inDir}/${ifile} ${tmpDir}
+	else
+	    trimBefore=''
+	    trimAfter=''
+	    newStart=${ftfStart}
+	    newEnd=${ftfEnd}
+	    if [[ $ftfStart -lt $TFStart ]]; then
+		yyyy=${ftfStart:0:4}
+		mm=${ftfStart:4:2}
+		yyyyR=${TFStart:0:4}
+		trimBefore=$((12*(yyyyR - yyyy) - (mm-1)  ))
+		newStart=${TFStart}
+	    fi
+	    if [[ $ftfEnd -gt $TFEnd ]]; then
+		yyyy=${ftfEnd:0:4}
+		mm=${ftfEnd:4:2}
+		yyyyR=${TFEnd:0:4}
+		lengthTimeArr=($(ncks -v time -m ${inDir}/${ifile} | grep -i 'dimension 0' | sed 's/.*size =//' ))
+		lengthTime=${lengthTimeArr[0]}
+		trimAfter=$((lengthTime -1 - ( 12*(yyyy - yyyyR) - (12-mm) )  ))
+		newEnd=${TFEnd}
+	    fi
+	    echo " --> "$trimBefore,$trimAfter
+	    newFileName=$(echo ${ifile} | sed 's/\([0-9]\{6\}\)-\([0-9]\{6\}\)\.nc//')${newStart}'-'${newEnd}'.nc'
+	    ncks -d time,${trimBefore},${trimAfter} -o ${tmpDir}/${newFileName} ${inDir}/${ifile}
+	fi
+    done
+
+done
+
+# now concatenate dates, consider only files in tmpDir
+#toConcatenate=($(find ${tmpDir} -name '*.nc' ! -size 0 -printf '%f\n' | grep -v "${TFStart}_${TFEnd}.nc"))
+# group them by outputs
+toConcatenate=($(find ${tmpDir} -name '*.nc' ! -size 0 -printf '%f\n' | grep -v "${TFStart}-${TFEnd}.nc" | sed 's/_\([0-9]\{6\}\)-\([0-9]\{6\}\)\.nc$//' | sort | uniq))
+
+for iConc in ${toConcatenate[@]}
+do
+    echo "Concatenating for "$iConc
+    # get list of datesCouples
+    concat=($(find ${tmpDir} -name ${iConc}'*.nc' | sed 's/.*_r\([0-9]\{1,2\}\)i\([0-9]\{1,2\}\)p\([0-9]\{1,2\}\)_//' | sed 's/\.nc//' | sort))
+    prevConcat=${concat[0]}
+    for ((iconcat=1; iconcat<${#concat[@]}; iconcat=iconcat+1))
+    do
+	# check continuity
+	thisTF=${concat[$iconcat]}
+	thisStart=${thisTF%-*}
+	prevStart=${prevConcat%-*}
+	thisStartCC=$(yyyymmToCounter ${thisStart})
+	prevStartCC=$(yyyymmToCounter ${prevStart})
+	if [[ $((prevStartCC+1)) -eq ${thisSTartCC} ]]; then
+	    # concatenate
+	    echo "concatenation to be finished"
+	fi
+    done
+done
+
+# from now, we will consider only file for the time frame $TFStart-$TFEnd
+lstToProcess=$(find ${tmpDir} -name '*_'${TFStart}'-'${TFEnd}'.nc' -type f ! -size 0 -printf '%f\n')
+# regrid
+regridFileThisTF=''
+for ifile in ${lstToProcess[@]}
+do
+    ${binDir}/regrid.py -o ${tmpDir}/regrid_${ifile} -v ${variable} ${tmpDir}/${ifile}
+    if [[ $? -eq 0 ]]; then
+	regridFileThisTF=(${regridFileThisTF} regrid_${ifile})
+    fi
+done
+# average, min, max
+${binDir}/myNcea.py -v ${variable}_CdmsRegrid -outDir ${outDir} -outFile ${variable}_${TFStart}'-'${TFEnd}.nc -path ${tmpDir} ${regridFileThisTF[@]}
+
+#rm -rf ${tmpDir}
+
+## EOF

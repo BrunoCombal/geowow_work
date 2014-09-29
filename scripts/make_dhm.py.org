@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+
+# to run the script with the correct version of uvcdat:
+#  source /usr/local/uvcdat/1.2.0/bin/setup_cdat.sh
+import cdms2
+from cdms2 import MV
+import numpy
+import glob
+import sys
+import os
+from os import path
+import re
+import make_ensembleMean_TOS as MEM # to share some functions
+import shutil
+
+# compute monthly average for several months, output is a reference year
+# the goal is to have a reference with minimized inter-annual effects
+def do_reference(indir, inYears, outdir, outfile, var):
+
+    unitsAvg=None
+    nodata  = 1.e20
+    minVar  = 273.15-40
+    maxVar  = 273.15+100
+
+    # for each month
+    for imonth in range(1, 12+1):
+        # list files: all models and year for month imonth
+        fileList=[]
+        for iyear in inYears:
+            idate='{0}{1:02}'.format(iyear,imonth)
+            tmp=[os.path.basename(f) for f in glob.glob('{0}/modelmean_{1}_{2}.nc'.format(indir, var, idate)) ]
+            for ii in tmp:
+                fileList.append(ii)
+
+        if len(fileList)==0:
+            print 'no file found. Exit(1).'
+            print '{0}/modelmean_{1}_*_{2}.nc'.format(indir, var, idate)
+            sys.exit(1)
+
+        # now compute average for this month
+        accumVar=None
+        accumN=None
+        print 'averaging {0} file for month {1}'.format(len(fileList), imonth)
+        print 'starting with {0}, ending with {1}'.format(os.path.basename(fileList[0]), os.path.basename(fileList[-1]))
+        for iFile in fileList:
+            thisFile = cdms2.open('{0}/{1}'.format(indir,iFile))
+            dimVar = numpy.squeeze(thisFile[var][:]).shape # remove time-single dimension if exists
+            thisVar = numpy.ravel(thisFile[var][:])
+            if accumVar is None:
+                accumVar  = numpy.zeros( dimVar[0]*dimVar[1] ) + nodata
+                accumN    = numpy.zeros( dimVar[0]*dimVar[1] )
+                unitsAvg  = thisFile[var].units
+                oneMatrix = numpy.ones(dimVar[0]*dimVar[1])
+
+            wtadd = (thisVar >= minVar ) * (thisVar <= maxVar) * (accumVar < nodata)
+            # if the value in accumVar is no-data, replace it.
+            wtreplace = (thisVar >= minVar ) * (thisVar <= maxVar) * ( accumVar >= nodata)
+            if wtadd.any():
+                # print 'adder ',thisVar[wtadd].max(), accumVar[wtadd].max(), accumN[wtadd].max()
+                accumVar[wtadd] = accumVar[wtadd] + thisVar[wtadd]
+                accumN[wtadd] = accumN[wtadd] + oneMatrix[wtadd]
+                # print 'adder ',thisVar[wtadd].max(), accumVar[wtadd].max(), accumN[wtadd].max()
+            if wtreplace.any():
+                # print 'replace'
+                accumVar[wtreplace] = thisVar[wtreplace]
+                accumN[wtreplace] = oneMatrix[wtreplace]
+
+            thisFile.close()
+
+        # now compute the average, where accumN is not 0
+        wnz = accumN > 0
+        average = numpy.zeros(dimVar[0] * dimVar[1]) + nodata
+        if wnz.any():
+            average[wnz] = accumVar[wnz] / accumN[wnz]
+
+        # save to disk
+        # for netcdf3: set flags to 0
+        cdms2.setNetcdfShuffleFlag(1)
+        cdms2.setNetcdfDeflateFlag(1)
+        cdms2.setNetcdfDeflateLevelFlag(3)
+
+        outfilename = '{0}/{1}_{2:02}_{3}'.format(outdir, var, imonth, outfile)
+        (referenceGrid, latAxis, lonAxis, latbounds, lonBounds) = MEM.makeGrid()
+        avgOut = cdms2.createVariable(numpy.reshape(average,dimVar),\
+                                          typecode='f', id=var, fill_value=1.e20, \
+                                          grid=referenceGrid, copyaxes=1, \
+                                          attributes=dict(long_name='model multi-year reference mean ({0})'.format(var), units=unitsAvg))
+        avgOut.setAxisList((latAxis, lonAxis))
+
+        accumOut = cdms2.createVariable(numpy.reshape(accumN,dimVar), \
+                                            typecode='i', id='count_{0}'.format(var), \
+                                            fill_value=1.e20, grid=referenceGrid, \
+                                            copyaxes=1, attributes=dict(long_name='count of valid {0}'.format(var), units=None))
+        accumOut.setAxisList((latAxis, lonAxis))
+
+        MEM.writeToFile(outfilename, avgOut, accumOut)
+
+# __________________________________________________________________
+# return the month count from year 0
+def yyyymm2count(year, month):
+    return year*12+month
+# __________________________________________________________________
+def count2yyyymm(count):
+    year=int((count-1)/12)
+    month = (count-12*year)
+    return (year, month)
+# __________________________________________________________________
+# DHM over a four months rolling windows
+def do_DHM(indir, outdir, referenceName, basename, years, variable):
+    threshold = 1.0
+    thresholdlvl2 = 2.0
+    nodata = 1.e20
+    (referenceGrid, latAxis, lonAxis, latBounds, lonBounds) = MEM.makeGrid()
+
+    for iyear in years:
+        for imonth in range(0, 12):
+            accum = None
+            for monthShift in [0, -1, -2, -3]:
+                thisDateCount = yyyymm2count(iyear, imonth+1)
+                (thisYear, thisMonth) = count2yyyymm(thisDateCount + monthShift)
+                currentFile = cdms2.open( '{0}/{1}_{2}_{3}{4:02}.nc'.format(indir, basename, variable, thisYear, thisMonth) )
+                referenceFile = cdms2.open( '{0}/{1}_{2:02}_{3}'.format(indir, variable, thisMonth, referenceName) )
+                if accum is None:
+                    accum = currentFile[variable][:]
+                curData = currentFile[variable][:]
+                refData = referenceFile[variable][:]
+                wtadd = (refData < nodata) * (accum < nodata) * (curData < nodata)
+                accum[wtadd] = accum[wtadd] + ( curData[wtadd] - refData[wtadd] )
+
+            # save to disk
+            # for netcdf3: set flags to 0
+            cdms2.setNetcdfShuffleFlag(1)
+            cdms2.setNetcdfDeflateFlag(1)
+            cdms2.setNetcdfDeflateLevelFlag(3)
+
+            outfilename='{0}/dhm_{1}{2:02}.nc'.format(outdir, iyear, imonth+1)
+            accumOut = cdms2.createVariable(accum, typecode='f', id='dhm4months', fill_value=1.e20, \
+                                              grid=referenceGrid, copyaxes=0, attributes=dict(long_name='DHM accum 4 months', units=None))            
+            dhmOut.setAxisList((latAxis, lonAxis))
+
+            if os.path.exists(outfilename): os.remove(outfilename)
+            outfile = cdms2.open(outfilename, 'w')
+            outfile.write(accumOut)
+
+            outfile.close()            
+
+            hfile.close()
+# dans la version ci-dessous, il y a probablement une erreur 
+#____________________________________________________________________
+def do_DHMold(indir, outdir, referenceName, basename, years, variable):
+
+    threshold = 1.0
+    thresholdlvl2 = 2.0
+    nodata = 1.e20
+    (referenceGrid, latAxis, lonAxis, latBounds, lonBounds) = MEM.makeGrid()
+
+    for iyear in years:
+        for imonth in range(0,12): # imonth=0, .., 11
+            # sum current month to reference(month, month-1, month-2)
+            # open current file and get data
+            hfile = cdms2.open('{0}/{1}_{2}_{3}{4:02}.nc'.format(indir, basename, variable, iyear, imonth+1))
+            print 'comparing ','{0}/{1}_{2}_{3}{4:02}.nc'.format(indir, basename, variable, iyear, imonth+1)
+            thisData = numpy.ravel(hfile[variable][:])
+            dhm = numpy.zeros(thisData.shape)
+            dhmlvl2 = numpy.zeros(thisData.shape)
+            count = numpy.zeros(thisData.shape)
+            countlvl2 = numpy.zeros(thisData.shape)
+            # open 3 reference files
+            for ishift in [0, -1, -2, -3]:
+                refFile = cdms2.open('{0}/{1}_{2:02}_{3}'.format(indir, var, (imonth+ishift)%12+1, referenceName))
+                print '\tto {0}'.format((imonth+ishift)%12+1)
+                refData = numpy.ravel(refFile[variable][:])
+                wtadd = ( ( thisData - refData) >= threshold) * (thisData < nodata) * (refData < nodata)
+                wtaddlvl2 =  ( ( thisData - refData) >= thresholdlvl2) * (thisData < nodata) * (refData < nodata)
+                if wtadd.any():
+                    dhm[wtadd] = dhm[wtadd] + (thisData[wtadd] - refData[wtadd])
+                    count[wtadd] = count[wtadd] + 1
+                if wtaddlvl2.any():
+                    dhmlvl2[wtaddlvl2] = dhmlvl2[wtaddlvl2] + (thisData[wtaddlvl2] - refData[wtaddlvl2])
+                    countlvl2[wtaddlvl2] = count[wtaddlvl2] + 1
+                refFile.close()
+
+            # save to disk
+            # for netcdf3: set flags to 0
+            cdms2.setNetcdfShuffleFlag(1)
+            cdms2.setNetcdfDeflateFlag(1)
+            cdms2.setNetcdfDeflateLevelFlag(3)
+
+            outfilename='{0}/dhm_{1}{2:02}.nc'.format(outdir, iyear, imonth+1)
+            dhmOut = cdms2.createVariable(dhm.reshape(hfile[variable].shape), \
+                                              typecode='f', id='dhm', fill_value=1.e20, \
+                                              grid=referenceGrid, copyaxes=0, attributes=dict(long_name='DHM', units=None))            
+            dhmOut.setAxisList((latAxis, lonAxis))
+
+            countOut = cdms2.createVariable(count.reshape(hfile[variable].shape), \
+                                                typecode='f', id='count', fill_value=1.e20, \
+                                                grid=referenceGrid, copyaxes=0, attributes=dict(long_name='count of valid {0}'.format(var), units=None))
+            countOut.setAxisList((latAxis, lonAxis))
+
+            dhmOutlvl2 = cdms2.createVariable(dhmlvl2.reshape(hfile[variable].shape), \
+                                                  typecode='f', id='dhm_lvl2', fill_value=1.e20, \
+                                                  grid=referenceGrid, copyaxes=0, attributes=dict(long_name='DHM level 2', units=None))
+            dhmOutlvl2.setAxisList((latAxis, lonAxis))
+
+            countOutlvl2 = cdms2.createVariable(count.reshape(hfile[variable].shape), \
+                                                    typecode='f', id='count_lvl2', fill_value=1.e20, \
+                                                    grid=referenceGrid, copyaxes=0, attributes=dict(long_name='count of valid {0} for level2'.format(var), units=None))
+            countOutlvl2.setAxisList((latAxis, lonAxis))
+
+            if os.path.exists(outfilename): os.remove(outfilename)
+            outfile = cdms2.open(outfilename, 'w')
+            outfile.write(dhmOut)
+            outfile.write(countOut)
+            outfile.write(dhmOutlvl2)
+            outfile.write(countOutlvl2)
+            outfile.close()            
+
+            hfile.close()
+
+    return
+# ______________
+# count frequency of DHM, level 1 and 2
+def do_DHMfrequency(indir, filelist, varList, outdir, outbasename):
+    
+    nodata = 1.e20
+    outfile=cdms2.open('{0}/{1}.nc'.format(outdir, outbasename),'w')
+    (referenceGrid, latAxis, lonAxis, latBounds, lonBounds) = MEM.makeGrid()
+
+    for ivar in varList:
+        frequency=None
+        for ifile in filelist:
+            thisFile=cdms2.open(ifile)
+            thisDim = thisFile[ivar][:].shape
+            thisData = numpy.ravel(thisFile[ivar][:])
+            wtadd = (thisData < nodata ) * (thisData > 0)
+            if frequency is None:
+                frequency=numpy.zeros(thisData.shape)
+
+            if wtadd.any():
+                frequency[wtadd] = frequency[wtadd] + 1.0
+
+            thisFile.close()
+
+        frequency[:] = frequency[:] / float(len(filelist))
+
+        # save to disk
+        # for netcdf3: set flags to 0
+        cdms2.setNetcdfShuffleFlag(0)
+        cdms2.setNetcdfDeflateFlag(0)
+        cdms2.setNetcdfDeflateLevelFlag(0)
+
+        freqOut = cdms2.createVariable( frequency.reshape(thisDim), \
+                                            typecode='f', id='{0}_{1}'.format('frequency',ivar) , \
+                                            fill_value=1.e20, grid=referenceGrid, copyaxes=1, \
+                                            attributes=dict(long_name='fraction of years in the dekad with non-null {0}'.format(ivar), units=None))
+        freqOut.setAxisList((latAxis, lonAxis))
+        outfile.write(freqOut)
+
+    outfile.close()
+
+# _______________
+if __name__=="__main__":
+
+    outdir='/data/cmip5/rcp/rcp8.5/tos_ensemble'
+    var='tos'
+
+    # No need to average on several year to cancel inter annual variability
+    #do_reference(outdir, range(2006, 2006), outdir, 'reference_dhm.nc', var)
+    ##do_reference(outdir, range(2028, 2032), outdir, 'mean2030.nc', var)
+    ##do_reference(outdir, range(2048,2052), outdir, 'mean2050.nc', var)
+    if 0==1 :
+        for imonth in range(1, 12+1):
+            srcname='{0}/modelmean_{1}_{2}{3:02}.nc'.format(outdir, var, 2006, imonth)
+            outfilename = '{0}/{1}_{2:02}_{3}'.format(outdir, var, imonth, 'reference_dhm.nc')
+            shutil.copyfile(srcname, outfilename)
+
+        years=range(2030,2039 + 1)
+        years.extend(range(2050,2059 + 1))
+        do_DHM(outdir, outdir, 'reference_dhm.nc', 'modelmean', years, var)
+
+    filelist=glob.glob('{0}/dhm_203[0-9]??.nc'.format(outdir))
+    do_DHMfrequency(outdir, filelist, ['dhm', 'dhm_lvl2'], outdir, 'dhm_frequency_2030')
+
+    filelist=glob.glob('{0}/dhm_205[0-9]??.nc'.format(outdir))
+    do_DHMfrequency(outdir, filelist, ['dhm', 'dhm_lvl2'], outdir, 'dhm_frequency_2050')

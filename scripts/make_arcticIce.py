@@ -198,7 +198,7 @@ def do_drawArticArea(filename, relative=True):
 if __name__=="__main__":
     sitDir='/data/cmip5/rcp/rcp8.5/new_sit'
     areacelloDir='/data/cmip5/rcp/rcp8.5/areacello'
-    csvFilename = '/home/bruno/Documents/tmp/articIce.csv'
+    csvFilename = '/home/bruno/Documents/tmp/arcticIce.csv'
     variable='sit'
 
     if 1==0:
